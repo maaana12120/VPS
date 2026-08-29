@@ -1,57 +1,348 @@
-
 name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    # Standard GitHub runner:
+    # 4 vCPU / 16 GB RAM / 14 GB SSD (public repositories)
+    #
+    # If you have a configured GitHub GPU Larger Runner,
+    # replace this with YOUR GPU RUNNER LABEL, for example:
+    # runs-on: windows-2025-4core-gpu
+    #
+    # Do NOT invent the label. Use the exact label shown in:
+    # Repository -> Settings -> Actions -> Runners
     runs-on: windows-latest
+
     timeout-minutes: 360
 
+    env:
+      RDP_USERNAME: NvDAdmin
+
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-      - name: 2. Create Admin Account
+      # =========================================================
+      # 1. Show the real hardware assigned by GitHub
+      # =========================================================
+      - name: 1. Show Runner Hardware
+        shell: powershell
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          Write-Host "============================================"
+          Write-Host " GitHub Runner Hardware"
+          Write-Host "============================================"
 
-      - name: 3. Install & Connect Tailscale VPN
+          $cpu = Get-CimInstance Win32_Processor |
+            Measure-Object -Property NumberOfLogicalProcessors -Sum
+
+          $ram = Get-CimInstance Win32_ComputerSystem
+
+          Write-Host "CPU Threads : $($cpu.Sum)"
+          Write-Host "RAM (GB)    : $([math]::Round($ram.TotalPhysicalMemory / 1GB, 2))"
+
+          Get-CimInstance Win32_LogicalDisk |
+            Where-Object { $_.DriveType -eq 3 } |
+            Select-Object DeviceID,
+              @{Name="SizeGB";Expression={[math]::Round($_.Size / 1GB, 2)}},
+              @{Name="FreeGB";Expression={[math]::Round($_.FreeSpace / 1GB, 2)}} |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "GPU:"
+          $gpus = Get-CimInstance Win32_VideoController
+
+          if ($gpus) {
+            $gpus | Select-Object Name,
+              @{Name="VRAM_GB";Expression={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  "Unknown"
+                }
+              }} | Format-Table -AutoSize
+          }
+          else {
+            Write-Host "No GPU detected."
+          }
+
+      # =========================================================
+      # 2. Configure Remote Desktop securely
+      # =========================================================
+      - name: 2. Enable Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          Restart-Service TermService -Force
+
+          Write-Host "Remote Desktop enabled."
+
+      # =========================================================
+      # 3. Create secure RDP admin account
+      # =========================================================
+      - name: 3. Create RDP Administrator
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD GitHub Secret is not configured."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword `
+              -AccountNeverExpires
+          }
+          else {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword
+          }
+
+          Add-LocalGroupMember `
+            -Group 'Administrators' `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group 'Remote Desktop Users' `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP account created/configured."
+
+      # =========================================================
+      # 4. Install Tailscale
+      # =========================================================
+      - name: 4. Install Tailscale
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 4. Keep Server Alive (48 Hours)
-        run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY GitHub Secret is not configured."
           }
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath 'msiexec.exe' `
+            -ArgumentList @(
+              '/i',
+              "`"$installer`"",
+              '/quiet',
+              '/norestart'
+            ) `
+            -Wait
+
+          Start-Sleep -Seconds 5
+
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale installation failed."
+          }
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server"
+
+          Start-Sleep -Seconds 8
+
+          $tsIp = & $tailscale ip -4
+
+          if ([string]::IsNullOrWhiteSpace($tsIp)) {
+            throw "Could not obtain Tailscale IPv4 address."
+          }
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host " RDP SERVER READY"
+          Write-Host "============================================"
+          Write-Host "Tailscale IP : $tsIp"
+          Write-Host "Username     : $env:RDP_USERNAME"
+          Write-Host "============================================"
+
+      # =========================================================
+      # 5. Install useful applications
+      # =========================================================
+      - name: 5. Install Applications
+        shell: powershell
+        run: |
+          Write-Host "Checking winget..."
+
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            throw "winget is not available on this runner image."
+          }
+
+          winget install `
+            --id Google.Chrome `
+            --exact `
+            --silent `
+            --accept-source-agreements `
+            --accept-package-agreements
+
+          winget install `
+            --id Microsoft.VisualStudioCode `
+            --exact `
+            --silent `
+            --accept-source-agreements `
+            --accept-package-agreements
+
+          winget install `
+            --id GitHub.cli `
+            --exact `
+            --silent `
+            --accept-source-agreements `
+            --accept-package-agreements
+
+          Write-Host "Applications installed."
+
+      # =========================================================
+      # 6. Make VS Code CLI available
+      # =========================================================
+      - name: 6. Configure VS Code CLI
+        shell: powershell
+        run: |
+          $possiblePaths = @(
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin",
+            "C:\Program Files\Microsoft VS Code\bin"
+          )
+
+          foreach ($path in $possiblePaths) {
+            if (Test-Path "$path\code.cmd") {
+              $env:PATH = "$path;$env:PATH"
+            }
+          }
+
+          $code = Get-Command code -ErrorAction SilentlyContinue
+
+          if (-not $code) {
+            throw "VS Code CLI (code) was not found."
+          }
+
+          code --version
+
+      # =========================================================
+      # 7. Install official Claude Code VS Code extension
+      # =========================================================
+      - name: 7. Install Claude Code Extension
+        shell: powershell
+        run: |
+          $extensionId = 'anthropic.claude-code'
+
+          Write-Host "Installing VS Code extension:"
+          Write-Host $extensionId
+
+          code --install-extension $extensionId --force
+
+          Write-Host ""
+          Write-Host "Installed extensions:"
+          code --list-extensions
+
+      # =========================================================
+      # 8. Verify everything
+      # =========================================================
+      - name: 8. Verify Environment
+        shell: powershell
+        run: |
+          Write-Host "============================================"
+          Write-Host " Verification"
+          Write-Host "============================================"
+
+          Write-Host ""
+          Write-Host "VS Code:"
+          code --version
+
+          Write-Host ""
+          Write-Host "GitHub CLI:"
+          gh --version
+
+          Write-Host ""
+          Write-Host "Chrome:"
+          $chromePaths = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+
+          foreach ($path in $chromePaths) {
+            if (Test-Path $path) {
+              (Get-Item $path).VersionInfo.FileVersion
+              break
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Claude Code Extension:"
+          code --list-extensions |
+            Where-Object { $_ -eq 'anthropic.claude-code' }
+
+          Write-Host ""
+          Write-Host "GPU:"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name,
+              @{Name='VRAM_GB';Expression={
+                if ($_.AdapterRAM) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                } else {
+                  'Unknown'
+                }
+              }} |
+            Format-Table -AutoSize
+
+      # =========================================================
+      # 9. Keep machine alive for approximately 6 hours
+      # =========================================================
+      - name: 9. Keep Server Alive
+        shell: powershell
+        run: |
+          # Workflow timeout is 360 minutes.
+          # Leave a few minutes for GitHub to terminate gracefully.
+          $keepAliveMinutes = 350
+
+          Write-Host "Server will remain active for approximately $keepAliveMinutes minutes."
+
+          for ($i = 1; $i -le $keepAliveMinutes; $i++) {
+            Start-Sleep -Seconds 60
+
+            if (($i % 10) -eq 0) {
+              Write-Host "[$i/$keepAliveMinutes] Server running..."
+            }
+          }
+
+          Write-Host "Keep-alive period completed."
+
