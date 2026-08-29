@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       runner_label:
-        description: "Runner label"
+        description: "GitHub Runner label"
         required: true
         default: "windows-latest"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
+
     runs-on: ${{ inputs.runner_label }}
+
+    # 6 hours maximum
     timeout-minutes: 360
 
     env:
@@ -27,44 +31,66 @@ jobs:
       - name: 1. Detect Hardware
         shell: powershell
         run: |
+          Write-Host ""
           Write-Host "============================================"
-          Write-Host " GitHub Runner Hardware"
+          Write-Host "       GITHUB RUNNER HARDWARE"
           Write-Host "============================================"
 
-          $cpu = Get-CimInstance Win32_Processor |
-            Measure-Object NumberOfLogicalProcessors -Sum
+          $processors = Get-CimInstance Win32_Processor
+
+          $logical = (
+            $processors |
+            Measure-Object -Property NumberOfLogicalProcessors -Sum
+          ).Sum
+
+          $cores = (
+            $processors |
+            Measure-Object -Property NumberOfCores -Sum
+          ).Sum
 
           $ram = Get-CimInstance Win32_ComputerSystem
 
-          Write-Host "CPU Threads : $($cpu.Sum)"
-          Write-Host "RAM (GB)    : $([math]::Round($ram.TotalPhysicalMemory / 1GB, 2))"
+          $ramGB = [math]::Round(
+            $ram.TotalPhysicalMemory / 1GB,
+            2
+          )
+
+          Write-Host "CPU Cores    : $cores"
+          Write-Host "CPU Threads  : $logical"
+          Write-Host "RAM          : $ramGB GB"
 
           Write-Host ""
-          Write-Host "DISKS:"
+          Write-Host "DISKS"
 
           Get-CimInstance Win32_LogicalDisk |
-            Where-Object { $_.DriveType -eq 3 } |
+            Where-Object {$_.DriveType -eq 3} |
             Select-Object DeviceID,
-                @{Name="SizeGB";Expression={[math]::Round($_.Size / 1GB,2)}},
-                @{Name="FreeGB";Expression={[math]::Round($_.FreeSpace / 1GB,2)}} |
+              @{Name="SizeGB";Expression={
+                [math]::Round($_.Size / 1GB, 2)
+              }},
+              @{Name="FreeGB";Expression={
+                [math]::Round($_.FreeSpace / 1GB, 2)
+              }} |
             Format-Table -AutoSize
 
           Write-Host ""
-          Write-Host "GPU:"
+          Write-Host "GPU"
 
           Get-CimInstance Win32_VideoController |
             Select-Object Name,
-                @{Name="VRAM_GB";Expression={
-                    if ($_.AdapterRAM) {
-                        [math]::Round($_.AdapterRAM / 1GB,2)
-                    } else {
-                        "Unknown"
-                    }
-                }} |
+              @{Name="VRAM_GB";Expression={
+                if ($_.AdapterRAM -and $_.AdapterRAM -gt 0) {
+                  [math]::Round($_.AdapterRAM / 1GB, 2)
+                }
+                else {
+                  "Unknown"
+                }
+              }} |
             Format-Table -AutoSize
 
           Write-Host ""
-          Write-Host "NVIDIA:"
+          Write-Host "NVIDIA"
+
           if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) {
             nvidia-smi
           }
@@ -75,15 +101,17 @@ jobs:
       # =========================================================
       # 2. Enable RDP
       # =========================================================
-      - name: 2. Enable Remote Desktop
+      - name: 2. Configure Remote Desktop
         shell: powershell
         run: |
+          Write-Host "Enabling Remote Desktop..."
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
             -Value 0
 
-          # Keep NLA enabled
+          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' `
@@ -96,12 +124,14 @@ jobs:
             -Name TermService `
             -StartupType Automatic
 
-          Restart-Service TermService -Force
+          Restart-Service `
+            -Name TermService `
+            -Force
 
-          Write-Host "RDP enabled."
+          Write-Host "Remote Desktop enabled."
 
       # =========================================================
-      # 3. Generate RDP password automatically
+      # 3. Create RDP user
       # =========================================================
       - name: 3. Create RDP Account
         shell: powershell
@@ -112,26 +142,38 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PROVIDED_PASSWORD)) {
 
             Write-Host "RDP_PASSWORD Secret not found."
-            Write-Host "Generating a temporary password..."
+            Write-Host "Generating temporary password..."
 
-            $chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*"
+            $upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+            $lower = "abcdefghijkmnopqrstuvwxyz"
+            $numbers = "23456789"
+            $special = "!@#$%^&*"
+
+            $passwordChars = (
+              $upper +
+              $lower +
+              $numbers +
+              $special
+            )
+
             $password = -join (
               1..20 | ForEach-Object {
-                $chars[(Get-Random -Maximum $chars.Length)]
+                $passwordChars[
+                  (Get-Random -Maximum $passwordChars.Length)
+                ]
               }
             )
 
           }
           else {
 
-            Write-Host "Using RDP_PASSWORD from GitHub Secret."
+            Write-Host "Using password from GitHub Secret."
+
             $password = $env:PROVIDED_PASSWORD
           }
 
-          # Mask password if it ever appears in logs
           "::add-mask::$password"
 
-          # Save password for later steps
           "RDP_PASSWORD_RUNTIME=$password" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -149,9 +191,12 @@ jobs:
 
           if (-not $user) {
 
+            Write-Host "Creating user $env:RDP_USERNAME..."
+
             New-LocalUser `
               -Name $env:RDP_USERNAME `
               -Password $securePassword `
+              -Description "Temporary RDP administrator" `
               -AccountNeverExpires `
               -PasswordNeverExpires `
               -UserMayNotChangePassword
@@ -159,22 +204,26 @@ jobs:
           }
           else {
 
+            Write-Host "User already exists. Updating password..."
+
             Set-LocalUser `
               -Name $env:RDP_USERNAME `
               -Password $securePassword
           }
 
+          # Administrator
           Add-LocalGroupMember `
             -Group "Administrators" `
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
+          # RDP Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP account created successfully."
+          Write-Host "RDP user configured."
 
       # =========================================================
       # 4. Install Tailscale
@@ -189,35 +238,47 @@ jobs:
             throw "TAILSCALE_AUTHKEY Secret is missing."
           }
 
-          $installer = "$env:TEMP\tailscale.msi"
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $installer
+          if (-not (Test-Path $tailscale)) {
 
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i `"$installer`" /quiet /norestart" `
-            -Wait
+            Write-Host "Installing Tailscale..."
 
-          Start-Sleep -Seconds 5
+            $installer = "$env:TEMP\tailscale.msi"
 
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+            Invoke-WebRequest `
+              -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+              -OutFile $installer
 
-          if (-not (Test-Path $ts)) {
-            throw "Tailscale installation failed."
+            Start-Process `
+              -FilePath "msiexec.exe" `
+              -ArgumentList "/i `"$installer`" /quiet /norestart" `
+              -Wait
+
+            Start-Sleep -Seconds 5
+          }
+          else {
+
+            Write-Host "Tailscale already installed."
           }
 
-          & $ts up `
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp-server"
 
           Start-Sleep -Seconds 8
 
-          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          $ip = (
+            & $tailscale ip -4 |
+            Select-Object -First 1
+          ).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Tailscale IP was not obtained."
+            throw "Tailscale IPv4 address was not obtained."
           }
 
           "::add-mask::$ip"
@@ -228,120 +289,271 @@ jobs:
               -Encoding utf8 `
               -Append
 
+          Write-Host "Tailscale connected."
+
       # =========================================================
-      # 5. Install Google Chrome
+      # 5. Helper: install package safely
       # =========================================================
-      - name: 5. Install Google Chrome
+      - name: 5. Install Required Applications
         shell: powershell
         run: |
 
-          winget install `
-            --id Google.Chrome `
-            --exact `
-            --silent `
-            --accept-source-agreements `
-            --accept-package-agreements
+          function Install-WingetPackage {
+            param(
+              [Parameter(Mandatory=$true)]
+              [string]$Id,
+
+              [Parameter(Mandatory=$true)]
+              [string]$Name
+            )
+
+            Write-Host ""
+            Write-Host "--------------------------------------------"
+            Write-Host "Checking $Name"
+            Write-Host "Package: $Id"
+            Write-Host "--------------------------------------------"
+
+            $installed = winget list `
+              --id $Id `
+              --exact `
+              --source winget `
+              2>$null
+
+            if ($LASTEXITCODE -eq 0 -and $installed) {
+              Write-Host "$Name is already installed."
+              return
+            }
+
+            Write-Host "Installing $Name..."
+
+            winget install `
+              --id $Id `
+              --exact `
+              --source winget `
+              --silent `
+              --accept-source-agreements `
+              --accept-package-agreements `
+              --disable-interactivity
+
+            $exitCode = $LASTEXITCODE
+
+            # winget can return 0 on success.
+            # Some preinstalled/unchanged packages can return 1.
+            if ($exitCode -ne 0) {
+
+              Write-Host "winget returned exit code $exitCode."
+
+              # Check again whether package actually exists.
+              $verify = winget list `
+                --id $Id `
+                --exact `
+                --source winget `
+                2>$null
+
+              if ($LASTEXITCODE -eq 0 -and $verify) {
+                Write-Host "$Name is installed. Continuing."
+                return
+              }
+
+              throw "Failed to install $Name."
+            }
+
+            Write-Host "$Name installed successfully."
+          }
+
+          # Chrome
+          Install-WingetPackage `
+            -Id "Google.Chrome" `
+            -Name "Google Chrome"
+
+          # Visual Studio Code
+          Install-WingetPackage `
+            -Id "Microsoft.VisualStudioCode" `
+            -Name "Visual Studio Code"
+
+          # GitHub CLI
+          Install-WingetPackage `
+            -Id "GitHub.cli" `
+            -Name "GitHub CLI"
 
       # =========================================================
-      # 6. Install Visual Studio Code
+      # 6. Locate VS Code
       # =========================================================
-      - name: 6. Install Visual Studio Code
+      - name: 6. Locate VS Code
         shell: powershell
         run: |
 
-          winget install `
-            --id Microsoft.VisualStudioCode `
-            --exact `
-            --silent `
-            --accept-source-agreements `
-            --accept-package-agreements
-
-      # =========================================================
-      # 7. Install GitHub CLI
-      # =========================================================
-      - name: 7. Install GitHub CLI
-        shell: powershell
-        run: |
-
-          winget install `
-            --id GitHub.cli `
-            --exact `
-            --silent `
-            --accept-source-agreements `
-            --accept-package-agreements
-
-      # =========================================================
-      # 8. Install Claude Code VS Code extension
-      # =========================================================
-      - name: 8. Install Claude Code Extension
-        shell: powershell
-        run: |
-
-          $codePaths = @(
+          $paths = @(
             "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd",
-            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd"
+            "$env:ProgramFiles\Microsoft VS Code\bin\code.exe",
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd",
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.exe"
           )
 
-          $code = $null
+          $codePath = $null
 
-          foreach ($path in $codePaths) {
+          foreach ($path in $paths) {
+
             if (Test-Path $path) {
-              $code = $path
+
+              $codePath = $path
               break
             }
           }
 
-          if (-not $code) {
-            throw "VS Code CLI not found."
+          if (-not $codePath) {
+
+            # Search PATH
+            $cmd = Get-Command code `
+              -ErrorAction SilentlyContinue
+
+            if ($cmd) {
+              $codePath = $cmd.Source
+            }
           }
 
-          & $code `
+          if (-not $codePath) {
+            throw "VS Code CLI was not found."
+          }
+
+          "VSCODE_PATH=$codePath" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "VS Code:"
+          Write-Host $codePath
+
+      # =========================================================
+      # 7. Install Claude Code VS Code extension
+      # =========================================================
+      - name: 7. Install Claude Code Extension
+        shell: powershell
+        run: |
+
+          if (-not $env:VSCODE_PATH) {
+            throw "VSCODE_PATH is not available."
+          }
+
+          $extensionId = "anthropic.claude-code"
+
+          Write-Host "Installing official Claude Code extension..."
+
+          & $env:VSCODE_PATH `
             --install-extension `
-            anthropic.claude-code `
+            $extensionId `
             --force
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Claude Code extension installation failed."
+          }
 
           Write-Host "Claude Code extension installed."
 
       # =========================================================
-      # 9. Verify installation
+      # 8. Verify applications
       # =========================================================
-      - name: 9. Verify Environment
+      - name: 8. Verify Applications
         shell: powershell
         run: |
 
           Write-Host ""
           Write-Host "============================================"
-          Write-Host " Installed Software"
+          Write-Host "        APPLICATION VERIFICATION"
           Write-Host "============================================"
 
+          # Chrome
           Write-Host ""
-          Write-Host "Claude Code Extension:"
-          code --list-extensions |
-            Where-Object { $_ -eq "anthropic.claude-code" }
+          Write-Host "Google Chrome"
 
-          Write-Host ""
-          Write-Host "Tailscale:"
-          & "C:\Program Files\Tailscale\tailscale.exe" status
+          $chrome = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) |
+          Where-Object {
+            Test-Path $_
+          } |
+          Select-Object -First 1
 
-          Write-Host ""
-          Write-Host "GPU:"
-          if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) {
-            nvidia-smi
+          if ($chrome) {
+
+            Write-Host "Installed:"
+            Write-Host $chrome
+
           }
           else {
+
+            Write-Host "Chrome executable was not found."
+          }
+
+          # VS Code
+          Write-Host ""
+          Write-Host "Visual Studio Code"
+
+          if (Test-Path $env:VSCODE_PATH) {
+
+            Write-Host "VS Code found."
+            Write-Host $env:VSCODE_PATH
+
+          }
+          else {
+
+            throw "VS Code was not found."
+          }
+
+          # GitHub CLI
+          Write-Host ""
+          Write-Host "GitHub CLI"
+
+          $gh = Get-Command gh.exe `
+            -ErrorAction SilentlyContinue
+
+          if ($gh) {
+
+            gh --version
+
+          }
+          else {
+
+            Write-Host "GitHub CLI not available in current PATH."
+          }
+
+          # Claude Code
+          Write-Host ""
+          Write-Host "Claude Code Extension"
+
+          & $env:VSCODE_PATH `
+            --list-extensions |
+            Where-Object {
+              $_ -eq "anthropic.claude-code"
+            }
+
+          # GPU
+          Write-Host ""
+          Write-Host "GPU"
+
+          if (Get-Command nvidia-smi.exe `
+                -ErrorAction SilentlyContinue) {
+
+            nvidia-smi
+
+          }
+          else {
+
             Write-Host "No NVIDIA GPU detected."
           }
 
       # =========================================================
-      # 10. Show connection information
+      # 9. Show RDP info
       # =========================================================
-      - name: 10. RDP Connection Information
+      - name: 9. RDP Connection Information
         shell: powershell
         run: |
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "             RDP SERVER READY"
+          Write-Host "              RDP SERVER READY"
           Write-Host "=================================================="
           Write-Host ""
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
@@ -352,27 +564,36 @@ jobs:
           Write-Host "mstsc"
           Write-Host ""
           Write-Host "Connect to:"
-          Write-Host "$env:TAILSCALE_IP"
+          Write-Host $env:TAILSCALE_IP
           Write-Host ""
           Write-Host "=================================================="
 
       # =========================================================
-      # 11. Keep alive ~6 hours
+      # 10. Keep runner alive for approximately 6 hours
       # =========================================================
-      - name: 11. Keep Server Alive
+      - name: 10. Keep Server Alive
         shell: powershell
         run: |
 
-          # Leave margin before the 360-minute job timeout.
+          # Leave some margin before GitHub's 360-minute timeout.
           $targetMinutes = 350
 
-          for ($i = 1; $i -le $targetMinutes; $i++) {
+          Write-Host ""
+          Write-Host "Server will stay alive for approximately $targetMinutes minutes."
+          Write-Host ""
+
+          for ($minute = 1; $minute -le $targetMinutes; $minute++) {
 
             Start-Sleep -Seconds 60
 
-            if (($i % 10) -eq 0) {
-              Write-Host "[$i/$targetMinutes] Server running..."
+            if (($minute % 10) -eq 0) {
+
+              $remaining = $targetMinutes - $minute
+
+              Write-Host "[$minute/$targetMinutes] Server running..."
+              Write-Host "Remaining: $remaining minutes"
             }
           }
 
+          Write-Host ""
           Write-Host "Keep-alive completed."
