@@ -1,19 +1,40 @@
-name: Windows Cloud RDP
+name: Windows RDP - Live Auto Snapshot
 
 on:
   workflow_dispatch:
+    inputs:
+      restore_latest:
+        description: "Restore latest snapshot before starting RDP"
+        required: true
+        default: true
+        type: boolean
+
+      final_snapshot:
+        description: "Create final snapshot before runner exits"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
-  build:
+  rdp:
     runs-on: windows-latest
     timeout-minutes: 360
 
     env:
       RDP_USERNAME: NvDAdmin
+      SNAPSHOT_TAG: rdp-snapshot
+      SESSION_ID: ${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
 
-      # 1. Enable Remote Desktop
+      # ============================================================
+      # 1. Enable RDP
+      # ============================================================
       - name: Enable Remote Desktop
         shell: powershell
         run: |
@@ -22,18 +43,21 @@ jobs:
             -Name 'fDenyTSConnections' `
             -Value 0
 
-          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' `
             -Value 1
 
           Enable-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop'
+            -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue
 
           Restart-Service TermService -Force
 
-      # 2. Create RDP account with random password
+
+      # ============================================================
+      # 2. Create RDP user
+      # ============================================================
       - name: Create RDP Account
         shell: powershell
         run: |
@@ -41,10 +65,8 @@ jobs:
           $lower   = "abcdefghijkmnopqrstuvwxyz"
           $numbers = "23456789"
           $special = "!@#$%^&*"
+          $all     = $upper + $lower + $numbers + $special
 
-          $allChars = $upper + $lower + $numbers + $special
-
-          # Guarantee at least one character from each category
           $chars = @(
             $upper[(Get-Random -Maximum $upper.Length)]
             $lower[(Get-Random -Maximum $lower.Length)]
@@ -52,26 +74,34 @@ jobs:
             $special[(Get-Random -Maximum $special.Length)]
           )
 
-          # Add remaining random characters
-          for ($i = 0; $i -lt 16; $i++) {
-            $chars += $allChars[(Get-Random -Maximum $allChars.Length)]
+          for ($i = 0; $i -lt 20; $i++) {
+            $chars += $all[(Get-Random -Maximum $all.Length)]
           }
 
-          # Shuffle
           $password = -join ($chars | Sort-Object { Get-Random })
 
-          $securePassword = ConvertTo-SecureString `
+          $secure = ConvertTo-SecureString `
             $password `
             -AsPlainText `
             -Force
 
-          New-LocalUser `
+          $existing = Get-LocalUser `
             -Name $env:RDP_USERNAME `
-            -Password $securePassword `
-            -AccountNeverExpires `
-            -PasswordNeverExpires `
-            -UserMayNotChangePassword `
             -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $secure
+          }
+          else {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $secure `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword
+          }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
@@ -83,23 +113,25 @@ jobs:
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          # Save for the next step
-          "RDP_PASSWORD=$password" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Encoding utf8 `
-            -Append
+          "RDP_PASSWORD=$password" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
 
-      # 3. Install and connect Tailscale
+
+      # ============================================================
+      # 3. Install Tailscale
+      # ============================================================
       - name: Connect Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "TAILSCALE_AUTHKEY Secret is missing."
+            throw "TAILSCALE_AUTHKEY secret is missing."
           }
 
-          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
           $installer = "$env:TEMP\tailscale.msi"
 
           Invoke-WebRequest `
@@ -113,51 +145,1172 @@ jobs:
 
           Start-Sleep -Seconds 5
 
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp-server"
 
           Start-Sleep -Seconds 8
 
-          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          $ip = (& $tailscale ip -4 |
+            Select-Object -First 1).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Could not get Tailscale IP."
+            throw "Tailscale IP could not be obtained."
           }
 
-          "TAILSCALE_IP=$ip" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Encoding utf8 `
-            -Append
+          "TAILSCALE_IP=$ip" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
 
-      # 4. Show RDP connection information
-      - name: RDP Ready
+
+      # ============================================================
+      # 4. Automatic Snapshot Engine
+      # ============================================================
+      - name: Start Live Snapshot Engine
         shell: powershell
+        env:
+          RESTORE_LATEST: ${{ inputs.restore_latest }}
+          FINAL_SNAPSHOT: ${{ inputs.final_snapshot }}
         run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $Repo = $env:GITHUB_REPOSITORY
+          $Tag  = $env:SNAPSHOT_TAG
+
+          $UserRoot = "C:\Users\$env:RDP_USERNAME"
+
+          $Root = "C:\RDP-AutoSnapshot"
+
+          $Work = "$Root\Work"
+
+          $LiveJournal = "$Root\live-journal.jsonl"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $Root,$Work |
+            Out-Null
+
+
+          # ========================================================
+          # GitHub helper
+          # ========================================================
+
+          function GH {
+            param(
+              [string[]]$Arguments
+            )
+
+            & gh @Arguments
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "GitHub CLI failed."
+            }
+          }
+
+
+          function GHGet {
+            param(
+              [string[]]$Arguments
+            )
+
+            $result = & gh @Arguments 2>$null
+
+            if ($LASTEXITCODE -ne 0) {
+              return $null
+            }
+
+            return ($result -join "`n")
+          }
+
+
+          # ========================================================
+          # Repository variables
+          # ========================================================
+
+          function SetVariable {
+            param(
+              $Name,
+              $Value
+            )
+
+            gh variable set `
+              $Name `
+              --body "$Value" `
+              --repo $Repo |
+              Out-Null
+          }
+
+
+          function GetVariable {
+            param(
+              $Name
+            )
+
+            return GHGet @(
+              "api",
+              "/repos/$Repo/actions/variables/$Name",
+              "--jq",
+              ".value"
+            )
+          }
+
+
+          # ========================================================
+          # Exclusions
+          # ========================================================
+
+          function IsExcluded {
+            param(
+              [string]$Path
+            )
+
+            $p = $Path.Replace("/","\").ToLowerInvariant()
+
+            if ($p -match "\\appdata\\local\\temp\\") {
+              return $true
+            }
+
+            if ($p -match "\\\.ssh\\id_[^\\]+$") {
+              return $true
+            }
+
+            if ($p -match "\\\.aws\\credentials$") {
+              return $true
+            }
+
+            if ($p -match "\\\.git-credentials$") {
+              return $true
+            }
+
+            if ($p -match "\\microsoft\\credentials\\") {
+              return $true
+            }
+
+            return $false
+          }
+
+
+          # ========================================================
+          # Full file scan
+          # ========================================================
+
+          function ScanFiles {
+
+            param(
+              [string]$Base
+            )
+
+            $files = @()
+
+            if (!(Test-Path $Base)) {
+              return $files
+            }
+
+            Get-ChildItem `
+              -LiteralPath $Base `
+              -File `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue |
+            ForEach-Object {
+
+              if (IsExcluded $_.FullName) {
+                return
+              }
+
+              try {
+
+                $relative =
+                  $_.FullName.Substring(
+                    $Base.Length
+                  ).TrimStart("\")
+
+                $hash =
+                  (Get-FileHash `
+                    $_.FullName `
+                    -Algorithm SHA256).Hash
+
+                $files += [PSCustomObject]@{
+                  path = $relative
+                  hash = $hash
+                  size = $_.Length
+                  modified =
+                    $_.LastWriteTimeUtc.ToString("o")
+                }
+
+              }
+              catch {}
+            }
+
+            return $files
+          }
+
+
+          # ========================================================
+          # Windows system inventory
+          # ========================================================
+
+          function CaptureSystemState {
+
+            param(
+              [string]$Destination
+            )
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $Destination |
+              Out-Null
+
+
+            # Installed applications
+            try {
+
+              winget export `
+                -o "$Destination\winget.json" `
+                --include-versions `
+                --accept-source-agreements `
+                2>$null |
+                Out-Null
+
+            }
+            catch {
+
+              "{}" |
+                Set-Content `
+                  "$Destination\winget.json"
+            }
+
+
+            # Environment variables
+            @{
+              User =
+                [Environment]::GetEnvironmentVariables(
+                  "User"
+                )
+
+              Machine =
+                [Environment]::GetEnvironmentVariables(
+                  "Machine"
+                )
+
+            } |
+              ConvertTo-Json -Depth 20 |
+              Set-Content `
+                "$Destination\environment.json"
+
+
+            # Services
+            Get-Service |
+              Select-Object `
+                Name,
+                DisplayName,
+                Status,
+                StartType |
+              ConvertTo-Json -Depth 10 |
+              Set-Content `
+                "$Destination\services.json"
+
+
+            # Scheduled Tasks
+            try {
+
+              Get-ScheduledTask |
+                Select-Object `
+                  TaskName,
+                  TaskPath,
+                  State |
+                ConvertTo-Json -Depth 10 |
+                Set-Content `
+                  "$Destination\tasks.json"
+
+            }
+            catch {}
+
+
+            # Firewall
+            try {
+
+              Get-NetFirewallRule |
+                Select-Object `
+                  DisplayName,
+                  Enabled,
+                  Direction,
+                  Action,
+                  Profile |
+                ConvertTo-Json -Depth 10 |
+                Set-Content `
+                  "$Destination\firewall.json"
+
+            }
+            catch {}
+
+
+            # Current-user registry
+            try {
+
+              reg export `
+                HKCU `
+                "$Destination\HKCU.reg" `
+                /y |
+                Out-Null
+
+            }
+            catch {}
+          }
+
+
+          # ========================================================
+          # GitHub Release
+          # ========================================================
+
+          function EnsureRelease {
+
+            $exists =
+              GHGet @(
+                "release",
+                "view",
+                $Tag,
+                "--repo",
+                $Repo
+              )
+
+            if (!$exists) {
+
+              GH @(
+                "release",
+                "create",
+                $Tag,
+                "--repo",
+                $Repo,
+                "--title",
+                "RDP Automatic Snapshots",
+                "--notes",
+                "Automatic Base + Delta snapshots."
+              )
+            }
+          }
+
+
+          # ========================================================
+          # Get manifest
+          # ========================================================
+
+          function GetManifest {
+
+            $dir = "$Work\Manifest"
+
+            Remove-Item `
+              $dir `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $dir |
+              Out-Null
+
+            gh release download `
+              $Tag `
+              --repo $Repo `
+              --pattern manifest.json `
+              --dir $dir `
+              --clobber `
+              2>$null
+
+            if (
+              $LASTEXITCODE -ne 0 -or
+              !(Test-Path "$dir\manifest.json")
+            ) {
+              return $null
+            }
+
+            try {
+
+              return (
+                Get-Content `
+                  "$dir\manifest.json" `
+                  -Raw |
+                ConvertFrom-Json
+              )
+
+            }
+            catch {
+
+              return $null
+            }
+          }
+
+
+          # ========================================================
+          # Save Snapshot
+          # ========================================================
+
+          function SaveSnapshot {
+
+            param(
+              [string]$Reason
+            )
+
+            Write-Host ""
+            Write-Host "=============================================="
+            Write-Host " AUTOMATIC SNAPSHOT STARTED"
+            Write-Host " Reason: $Reason"
+            Write-Host "=============================================="
+
+            EnsureRelease
+
+            # Full scan
+            $current =
+              @(ScanFiles $UserRoot)
+
+
+            # Windows state
+            $systemState =
+              "$Work\SystemState"
+
+            Remove-Item `
+              $systemState `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            CaptureSystemState `
+              $systemState
+
+
+            $old = GetManifest
+
+
+            # ======================================================
+            # First snapshot = BASE
+            # ======================================================
+
+            if (!$old) {
+
+              $sequence = 1
+
+              $base =
+                "base-{0:D4}.zip" -f $sequence
+
+              $build =
+                "$Work\Base"
+
+              Remove-Item `
+                $build `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path "$build\Files" |
+                Out-Null
+
+
+              foreach ($file in $current) {
+
+                $src =
+                  Join-Path `
+                    $UserRoot `
+                    $file.path
+
+                if (!(Test-Path $src)) {
+                  continue
+                }
+
+                $dst =
+                  Join-Path `
+                    "$build\Files" `
+                    $file.path
+
+                New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  -Path (
+                    Split-Path $dst -Parent
+                  ) |
+                  Out-Null
+
+                Copy-Item `
+                  $src `
+                  $dst `
+                  -Force
+              }
+
+
+              Copy-Item `
+                $systemState `
+                "$build\SystemState" `
+                -Recurse `
+                -Force
+
+
+              Compress-Archive `
+                -Path "$build\*" `
+                -DestinationPath "$Work\$base" `
+                -CompressionLevel Optimal `
+                -Force
+
+
+              gh release upload `
+                $Tag `
+                "$Work\$base" `
+                --repo $Repo `
+                --clobber |
+                Out-Null
+
+
+              $manifest = @{
+                schema = 1
+                sequence = 1
+                baseAsset = $base
+                deltaAssets = @()
+                files = $current
+                createdUtc =
+                  [DateTime]::UtcNow.ToString("o")
+                changedFiles = $current.Count
+                deletedFiles = 0
+                reason = $Reason
+              }
+
+            }
+
+            # ======================================================
+            # Delta Snapshot
+            # ======================================================
+
+            else {
+
+              $oldMap = @{}
+
+              foreach ($f in @($old.files)) {
+                $oldMap[$f.path] = $f
+              }
+
+
+              $newMap = @{}
+
+              foreach ($f in $current) {
+                $newMap[$f.path] = $f
+              }
+
+
+              $changed = @()
+
+              foreach ($f in $current) {
+
+                if (
+                  !$oldMap.ContainsKey($f.path) -or
+                  $oldMap[$f.path].hash -ne $f.hash
+                ) {
+                  $changed += $f
+                }
+              }
+
+
+              $deleted = @()
+
+              foreach ($f in @($old.files)) {
+
+                if (!$newMap.ContainsKey($f.path)) {
+                  $deleted += $f.path
+                }
+              }
+
+
+              $sequence =
+                [int]$old.sequence + 1
+
+              $base =
+                [string]$old.baseAsset
+
+              $deltas =
+                @($old.deltaAssets)
+
+              $delta =
+                "delta-{0:D4}.zip" -f $sequence
+
+
+              $build =
+                "$Work\Delta"
+
+              Remove-Item `
+                $build `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path "$build\Files" |
+                Out-Null
+
+
+              foreach ($file in $changed) {
+
+                $src =
+                  Join-Path `
+                    $UserRoot `
+                    $file.path
+
+                if (!(Test-Path $src)) {
+                  continue
+                }
+
+                $dst =
+                  Join-Path `
+                    "$build\Files" `
+                    $file.path
+
+                New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  -Path (
+                    Split-Path $dst -Parent
+                  ) |
+                  Out-Null
+
+                Copy-Item `
+                  $src `
+                  $dst `
+                  -Force
+              }
+
+
+              $deleted |
+                ConvertTo-Json |
+                Set-Content `
+                  "$build\deleted.json"
+
+
+              Copy-Item `
+                $systemState `
+                "$build\SystemState" `
+                -Recurse `
+                -Force
+
+
+              Compress-Archive `
+                -Path "$build\*" `
+                -DestinationPath "$Work\$delta" `
+                -CompressionLevel Optimal `
+                -Force
+
+
+              gh release upload `
+                $Tag `
+                "$Work\$delta" `
+                --repo $Repo `
+                --clobber |
+                Out-Null
+
+
+              $deltas += $delta
+
+
+              $manifest = @{
+                schema = 1
+                sequence = $sequence
+                baseAsset = $base
+                deltaAssets = $deltas
+                files = $current
+                createdUtc =
+                  [DateTime]::UtcNow.ToString("o")
+                changedFiles = $changed.Count
+                deletedFiles = $deleted.Count
+                reason = $Reason
+              }
+            }
+
+
+            # ======================================================
+            # Write manifest
+            # ======================================================
+
+            $manifestPath =
+              "$Work\manifest.json"
+
+            $manifest |
+              ConvertTo-Json -Depth 30 |
+              Set-Content `
+                $manifestPath
+
+
+            gh release upload `
+              $Tag `
+              $manifestPath `
+              --repo $Repo `
+              --clobber |
+              Out-Null
+
+
+            Write-Host ""
+            Write-Host "SNAPSHOT COMPLETED"
+            Write-Host "Sequence: $($manifest.sequence)"
+            Write-Host "Changed: $($manifest.changedFiles)"
+            Write-Host "Deleted: $($manifest.deletedFiles)"
+          }
+
+
+          # ========================================================
+          # Restore
+          # ========================================================
+
+          function RestoreLatest {
+
+            $manifest =
+              GetManifest
+
+            if (!$manifest) {
+
+              Write-Host "No previous snapshot found."
+
+              return
+            }
+
+
+            $restore =
+              "$Work\Restore"
+
+            Remove-Item `
+              $restore `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $restore |
+              Out-Null
+
+
+            # Base
+            gh release download `
+              $Tag `
+              --repo $Repo `
+              --pattern $manifest.baseAsset `
+              --dir $restore `
+              --clobber
+
+
+            Expand-Archive `
+              "$restore\$($manifest.baseAsset)" `
+              "$restore\Base" `
+              -Force
+
+
+            Get-ChildItem `
+              "$restore\Base\Files" `
+              -File `
+              -Recurse `
+              -Force |
+            ForEach-Object {
+
+              $relative =
+                $_.FullName.Substring(
+                  "$restore\Base\Files".Length
+                ).TrimStart("\")
+
+              $destination =
+                Join-Path `
+                  $UserRoot `
+                  $relative
+
+              New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path (
+                  Split-Path `
+                    $destination `
+                    -Parent
+                ) |
+                Out-Null
+
+              Copy-Item `
+                $_.FullName `
+                $destination `
+                -Force
+            }
+
+
+            # Delta chain
+            foreach ($delta in @($manifest.deltaAssets)) {
+
+              gh release download `
+                $Tag `
+                --repo $Repo `
+                --pattern $delta `
+                --dir $restore `
+                --clobber
+
+
+              $deltaDir =
+                "$restore\CurrentDelta"
+
+              Remove-Item `
+                $deltaDir `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Expand-Archive `
+                "$restore\$delta" `
+                $deltaDir `
+                -Force
+
+
+              if(Test-Path "$deltaDir\Files") {
+
+                Get-ChildItem `
+                  "$deltaDir\Files" `
+                  -File `
+                  -Recurse `
+                  -Force |
+                ForEach-Object {
+
+                  $relative =
+                    $_.FullName.Substring(
+                      "$deltaDir\Files".Length
+                    ).TrimStart("\")
+
+                  $destination =
+                    Join-Path `
+                      $UserRoot `
+                      $relative
+
+                  New-Item `
+                    -ItemType Directory `
+                    -Force `
+                    -Path (
+                      Split-Path `
+                        $destination `
+                        -Parent
+                    ) |
+                    Out-Null
+
+                  Copy-Item `
+                    $_.FullName `
+                    $destination `
+                    -Force
+                }
+              }
+
+
+              if(Test-Path "$deltaDir\deleted.json") {
+
+                $deleted =
+                  @(Get-Content `
+                    "$deltaDir\deleted.json" `
+                    -Raw |
+                    ConvertFrom-Json)
+
+                foreach($relative in $deleted) {
+
+                  $target =
+                    Join-Path `
+                      $UserRoot `
+                      $relative
+
+                  if(Test-Path $target -PathType Leaf) {
+
+                    Remove-Item `
+                      $target `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+                  }
+                }
+              }
+            }
+
+
+            Write-Host ""
+            Write-Host "=============================================="
+            Write-Host " RESTORE COMPLETE"
+            Write-Host " Snapshot: $($manifest.sequence)"
+            Write-Host "=============================================="
+          }
+
+
+          # ========================================================
+          # Restore previous environment
+          # ========================================================
+
+          if (
+            "$env:RESTORE_LATEST" -eq "true"
+          ) {
+            RestoreLatest
+          }
+
+
+          # ========================================================
+          # Initial snapshot
+          # ========================================================
+
+          if (!(GetManifest)) {
+            SaveSnapshot "initial"
+          }
+
+
+          # ========================================================
+          # LIVE FILE WATCHER
+          # ========================================================
+
+          Remove-Item `
+            $LiveJournal `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+
+          $watcher =
+            New-Object `
+              System.IO.FileSystemWatcher
+
+          $watcher.Path =
+            $UserRoot
+
+          $watcher.IncludeSubdirectories =
+            $true
+
+          $watcher.EnableRaisingEvents =
+            $true
+
+
+          $eventAction = {
+
+            $path =
+              $Event.SourceEventArgs.FullPath
+
+            if (!(IsExcluded $path)) {
+
+              [PSCustomObject]@{
+
+                utc =
+                  [DateTime]::UtcNow.ToString("o")
+
+                event =
+                  $Event.SourceEventArgs.ChangeType.ToString()
+
+                path =
+                  $path
+
+              } |
+              ConvertTo-Json -Compress |
+              Add-Content `
+                $using:LiveJournal
+            }
+          }
+
+
+          $subscriptions = @()
+
+          foreach (
+            $eventName in
+            @(
+              "Created",
+              "Changed",
+              "Deleted",
+              "Renamed"
+            )
+          ) {
+
+            $subscriptions +=
+              Register-ObjectEvent `
+                -InputObject $watcher `
+                -EventName $eventName `
+                -Action $eventAction
+          }
+
+
+          # ========================================================
+          # Register active session
+          # ========================================================
+
+          SetVariable `
+            "RDP_SESSION_ID" `
+            $env:SESSION_ID
+
+          SetVariable `
+            "RDP_SAVE_REQUEST" `
+            "0"
+
+          SetVariable `
+            "RDP_SAVE_ACK" `
+            "0"
+
+
+          # ========================================================
+          # Display RDP
+          # ========================================================
+
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "              RDP SERVER IS READY"
+          Write-Host "              RDP SERVER READY"
           Write-Host "=================================================="
           Write-Host ""
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "Username     : $env:RDP_USERNAME"
           Write-Host "Password     : $env:RDP_PASSWORD"
           Write-Host ""
-          Write-Host "Open Windows Remote Desktop (mstsc)"
-          Write-Host "and connect to the Tailscale IP above."
-          Write-Host ""
+          Write-Host "Live Snapshot Engine : ACTIVE"
+          Write-Host "File Watcher         : ACTIVE"
           Write-Host "=================================================="
 
-      # 5. Keep the RDP alive for approximately 6 hours
-      - name: Keep Server Alive
-        shell: powershell
-        run: |
-          $minutes = 350
 
-          for ($i = 1; $i -le $minutes; $i++) {
-            Start-Sleep -Seconds 60
+          # ========================================================
+          # Main loop
+          # ========================================================
 
-            if (($i % 10) -eq 0) {
-              Write-Host "[$i/$minutes] Server running..."
+          $started =
+            Get-Date
+
+          $lastRequest =
+            GetVariable "RDP_SAVE_REQUEST"
+
+
+          try {
+
+            while (
+              ((Get-Date) - $started).TotalMinutes -lt 345
+            ) {
+
+              # ----------------------------------------------------
+              # Check Force Snapshot request
+              # ----------------------------------------------------
+
+              $request =
+                GetVariable "RDP_SAVE_REQUEST"
+
+
+              if (
+                $request -and
+                $request -ne "0" -and
+                $request -ne $lastRequest -and
+                $request.StartsWith(
+                  "$env:SESSION_ID`:"
+                )
+              ) {
+
+                $lastRequest =
+                  $request
+
+                try {
+
+                  SaveSnapshot `
+                    "force-request"
+
+                  SetVariable `
+                    "RDP_SAVE_ACK" `
+                    $request
+                }
+                catch {
+
+                  Write-Host `
+                    "Snapshot failed: $($_.Exception.Message)"
+                }
+              }
+
+
+              # ----------------------------------------------------
+              # Automatic periodic snapshot
+              #
+              # Every 5 minutes a full hash scan is performed.
+              # The watcher continues recording changes in between.
+              # ----------------------------------------------------
+
+              if (
+                !(
+                  Get-Variable `
+                    LastScan `
+                    -Scope Script `
+                    -ErrorAction SilentlyContinue
+                )
+              ) {
+
+                $script:LastScan =
+                  Get-Date
+              }
+
+
+              if (
+                ((Get-Date) - $script:LastScan).TotalMinutes -ge 5
+              ) {
+
+                try {
+
+                  SaveSnapshot `
+                    "automatic-5-minute"
+
+                }
+                catch {
+
+                  Write-Host `
+                    "Automatic snapshot error: $($_.Exception.Message)"
+                }
+
+                $script:LastScan =
+                  Get-Date
+              }
+
+
+              Start-Sleep `
+                -Seconds 10
+            }
+          }
+          finally {
+
+            # Stop watcher
+            foreach($s in $subscriptions) {
+
+              Unregister-Event `
+                -SubscriptionId $s.Id `
+                -ErrorAction SilentlyContinue
+            }
+
+            $watcher.EnableRaisingEvents =
+              $false
+
+            $watcher.Dispose()
+
+
+            # Final snapshot
+            if (
+              "$env:FINAL_SNAPSHOT" -eq "true"
+            ) {
+
+              try {
+
+                SaveSnapshot `
+                  "runner-exit"
+
+              }
+              catch {
+
+                Write-Host `
+                  "Final snapshot failed."
+              }
+            }
+
+
+            # Clear active session
+            if (
+              (GetVariable "RDP_SESSION_ID") `
+              -eq $env:SESSION_ID
+            ) {
+
+              SetVariable `
+                "RDP_SESSION_ID" `
+                ""
             }
           }
