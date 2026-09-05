@@ -17,10 +17,8 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
-
   rdp:
     runs-on: windows-latest
     timeout-minutes: 360
@@ -33,29 +31,26 @@ jobs:
     steps:
 
       # ============================================================
-      # 1. Enable RDP
+      # 1. ENABLE RDP
       # ============================================================
 
       - name: Enable Remote Desktop
         shell: powershell
         run: |
-
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Enabling Remote Desktop..."
-
           Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections `
             -Value 0
 
           Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication `
             -Value 1
 
           Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop" `
+            -DisplayGroup 'Remote Desktop' `
             -ErrorAction SilentlyContinue
 
           Restart-Service `
@@ -63,17 +58,15 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP enabled."
-
+          Write-Host "Remote Desktop enabled."
 
       # ============================================================
-      # 2. Create RDP account
+      # 2. CREATE RDP USER
       # ============================================================
 
       - name: Create RDP Account
         shell: powershell
         run: |
-
           $ErrorActionPreference = "Stop"
 
           $upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -132,18 +125,18 @@ jobs:
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          # Mask password in GitHub logs
           Write-Output "::add-mask::$password"
 
           "RDP_PASSWORD=$password" |
             Out-File `
-              -FilePath $env:GITHUB_ENV `
+              $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
+          Write-Host "RDP account ready."
 
       # ============================================================
-      # 3. Install Tailscale
+      # 3. TAILSCALE
       # ============================================================
 
       - name: Connect Tailscale
@@ -152,14 +145,11 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
 
         run: |
-
           $ErrorActionPreference = "Stop"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
               throw "TAILSCALE_AUTHKEY secret is missing."
           }
-
-          Write-Host "Installing Tailscale..."
 
           $installer = "$env:TEMP\tailscale.msi"
 
@@ -174,14 +164,11 @@ jobs:
 
           Start-Sleep -Seconds 8
 
-          $tailscale =
-            "C:\Program Files\Tailscale\tailscale.exe"
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 
           if (!(Test-Path $tailscale)) {
-              throw "Tailscale executable was not found."
+              throw "Tailscale executable not found."
           }
-
-          Write-Host "Connecting Tailscale..."
 
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
@@ -191,30 +178,30 @@ jobs:
               throw "Tailscale connection failed."
           }
 
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 8
 
-          $ip =
-            (& $tailscale ip -4 |
-              Select-Object -First 1).Trim()
+          $ip = (
+              & $tailscale ip -4 |
+              Select-Object -First 1
+          ).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-              throw "Could not obtain Tailscale IPv4 address."
+              throw "Tailscale IPv4 address not found."
           }
 
           "TAILSCALE_IP=$ip" |
             Out-File `
-              -FilePath $env:GITHUB_ENV `
+              $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
-          Write-Host "Tailscale connected."
-
+          Write-Host "Tailscale IP: $ip"
 
       # ============================================================
-      # 4. Snapshot / Restore / Live Watcher
+      # 4. SNAPSHOT ENGINE
       # ============================================================
 
-      - name: RDP Snapshot Engine
+      - name: Snapshot Engine
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -225,27 +212,13 @@ jobs:
 
           $ErrorActionPreference = "Stop"
 
-          # ========================================================
-          # Configuration
-          # ========================================================
+          $Repo = $env:GITHUB_REPOSITORY
+          $Tag  = $env:SNAPSHOT_TAG
 
-          $Repo =
-            $env:GITHUB_REPOSITORY
+          $UserRoot = "C:\Users\$env:RDP_USERNAME"
 
-          $Tag =
-            $env:SNAPSHOT_TAG
-
-          $UserRoot =
-            "C:\Users\$env:RDP_USERNAME"
-
-          $Root =
-            "C:\RDP-AutoSnapshot"
-
-          $Work =
-            "$Root\Work"
-
-          $LiveJournal =
-            "$Root\live-journal.jsonl"
+          $Root = "C:\RDP-AutoSnapshot"
+          $Work = "$Root\Work"
 
           New-Item `
             -ItemType Directory `
@@ -255,377 +228,95 @@ jobs:
 
 
           # ========================================================
-          # Verify GitHub CLI
+          # GITHUB CLI
           # ========================================================
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "Checking GitHub CLI"
-          Write-Host "=============================================="
-
-          if (!(Get-Command gh -ErrorAction SilentlyContinue)) {
-              throw "GitHub CLI (gh) is not installed."
-          }
 
           if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
               throw "GH_TOKEN is empty."
           }
 
-          Write-Host "Repository: $Repo"
-
-          & gh --version
-
-          Write-Host ""
-          Write-Host "Testing GitHub authentication..."
-
-          & gh auth status
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "GitHub authentication failed."
-          }
-
-          Write-Host "GitHub authentication: OK"
-
-
-          # ========================================================
-          # GitHub command wrapper
-          # ========================================================
-
-          function Invoke-GH {
+          function GH {
 
               param(
                   [Parameter(Mandatory=$true)]
-                  [string[]]$Arguments
+                  [string[]]$Args
               )
 
-              Write-Host ""
-              Write-Host "GH COMMAND:"
-              Write-Host "gh $($Arguments -join ' ')"
+              $output = & gh @Args 2>&1
 
-              & gh @Arguments
-
-              $code =
-                $LASTEXITCODE
+              $code = $LASTEXITCODE
 
               if ($code -ne 0) {
 
-                  throw `
-                    "GitHub CLI command failed. Exit code: $code"
+                  Write-Host ($output -join "`n")
+
+                  throw "GitHub CLI failed with exit code $code"
               }
+
+              return $output
           }
 
 
-          # ========================================================
-          # GitHub GET
-          # ========================================================
-
-          function Get-GH {
+          function GH-Safe {
 
               param(
                   [Parameter(Mandatory=$true)]
-                  [string[]]$Arguments
+                  [string[]]$Args
               )
 
-              $result =
-                & gh @Arguments 2>&1
+              $output = & gh @Args 2>&1
 
-              $code =
-                $LASTEXITCODE
-
-              if ($code -ne 0) {
-
-                  Write-Host "GitHub command output:"
-                  $result | ForEach-Object {
-                      Write-Host $_
-                  }
-
+              if ($LASTEXITCODE -ne 0) {
                   return $null
               }
 
-              return (
-                $result -join "`n"
-              )
+              return ($output -join "`n")
           }
 
 
           # ========================================================
-          # Repository variable
-          # ========================================================
-
-          function Set-RepoVariable {
-
-              param(
-                  [string]$Name,
-                  [string]$Value
-              )
-
-              $existing =
-                Get-GH @(
-                  "variable",
-                  "get",
-                  $Name,
-                  "--repo",
-                  $Repo
-                )
-
-              if ($null -eq $existing) {
-
-                  Write-Host "Creating variable: $Name"
-
-                  Invoke-GH @(
-                    "variable",
-                    "set",
-                    $Name,
-                    "--body",
-                    $Value,
-                    "--repo",
-                    $Repo
-                  )
-
-              }
-              else {
-
-                  Write-Host "Updating variable: $Name"
-
-                  Invoke-GH @(
-                    "variable",
-                    "set",
-                    $Name,
-                    "--body",
-                    $Value,
-                    "--repo",
-                    $Repo
-                  )
-              }
-          }
-
-
-          function Get-RepoVariable {
-
-              param(
-                  [string]$Name
-              )
-
-              $result =
-                Get-GH @(
-                  "variable",
-                  "get",
-                  $Name,
-                  "--repo",
-                  $Repo,
-                  "--json",
-                  "value",
-                  "--jq",
-                  ".value"
-                )
-
-              return $result
-          }
-
-
-          # ========================================================
-          # Ensure Release exists
+          # RELEASE
           # ========================================================
 
           function Ensure-Release {
 
-              Write-Host ""
-              Write-Host "Checking snapshot release..."
-
-              $release =
-                Get-GH @(
+              $release = GH-Safe @(
                   "release",
                   "view",
                   $Tag,
                   "--repo",
                   $Repo
-                )
+              )
 
-              if ($null -eq $release) {
+              if (-not $release) {
 
-                  Write-Host "Creating release: $Tag"
+                  Write-Host "Creating snapshot release..."
 
-                  Invoke-GH @(
-                    "release",
-                    "create",
-                    $Tag,
-                    "--repo",
-                    $Repo,
-                    "--title",
-                    "RDP Automatic Snapshots",
-                    "--notes",
-                    "Automatic Base + Delta snapshots for Windows RDP."
-                  )
-              }
-              else {
-
-                  Write-Host "Snapshot release already exists."
+                  GH @(
+                      "release",
+                      "create",
+                      $Tag,
+                      "--repo",
+                      $Repo,
+                      "--title",
+                      "RDP Automatic Snapshots",
+                      "--notes",
+                      "Automatic Windows RDP snapshots."
+                  ) | Out-Null
               }
           }
 
 
           # ========================================================
-          # Security exclusions
+          # MANIFEST
           # ========================================================
 
-          function Test-Excluded {
+          function Download-Manifest {
 
-              param(
-                  [string]$Path
-              )
-
-              $p =
-                $Path.Replace("/","\").ToLowerInvariant()
-
-
-              # Temporary data
-              if (
-                $p -match "\\appdata\\local\\temp\\"
-              ) {
-                  return $true
-              }
-
-
-              # SSH private keys
-              if (
-                $p -match "\\\.ssh\\id_[^\\]+$"
-              ) {
-                  return $true
-              }
-
-
-              # AWS credentials
-              if (
-                $p -match "\\\.aws\\credentials$"
-              ) {
-                  return $true
-              }
-
-
-              # Git credentials
-              if (
-                $p -match "\\\.git-credentials$"
-              ) {
-                  return $true
-              }
-
-
-              # Windows credentials
-              if (
-                $p -match "\\microsoft\\credentials\\"
-              ) {
-                  return $true
-              }
-
-
-              # Browser passwords
-              if (
-                $p -match "\\login data$"
-              ) {
-                  return $true
-              }
-
-
-              return $false
-          }
-
-
-          # ========================================================
-          # Full SHA-256 file scan
-          # ========================================================
-
-          function Get-FileManifest {
-
-              param(
-                  [string]$BasePath
-              )
-
-              $result =
-                New-Object System.Collections.Generic.List[object]
-
-
-              if (!(Test-Path $BasePath)) {
-                  return $result
-              }
-
-
-              Write-Host ""
-              Write-Host "Starting full SHA-256 scan..."
-
-              Get-ChildItem `
-                -LiteralPath $BasePath `
-                -File `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue |
-              ForEach-Object {
-
-                  if (
-                    Test-Excluded $_.FullName
-                  ) {
-                      return
-                  }
-
-
-                  try {
-
-                      $relative =
-                        $_.FullName.Substring(
-                          $BasePath.Length
-                        ).TrimStart("\")
-
-
-                      $hash =
-                        (
-                          Get-FileHash `
-                            -LiteralPath $_.FullName `
-                            -Algorithm SHA256 `
-                            -ErrorAction Stop
-                        ).Hash
-
-
-                      $result.Add(
-                        [PSCustomObject]@{
-                            path =
-                              $relative
-
-                            hash =
-                              $hash
-
-                            size =
-                              $_.Length
-
-                            modified =
-                              $_.LastWriteTimeUtc.ToString("o")
-                        }
-                      )
-                  }
-                  catch {
-                      Write-Host `
-                        "Could not hash: $($_.FullName)"
-                  }
-              }
-
-
-              Write-Host `
-                "SHA-256 scan complete: $($result.Count) files"
-
-              return $result
-          }
-
-
-          # ========================================================
-          # Capture Windows configuration
-          # ========================================================
-
-          function Save-SystemState {
-
-              param(
-                  [string]$Destination
-              )
+              $dir = "$Work\Manifest"
 
               Remove-Item `
-                $Destination `
+                $dir `
                 -Recurse `
                 -Force `
                 -ErrorAction SilentlyContinue
@@ -633,15 +324,177 @@ jobs:
               New-Item `
                 -ItemType Directory `
                 -Force `
-                -Path $Destination |
+                -Path $dir |
+                Out-Null
+
+              GH-Safe @(
+                  "release",
+                  "download",
+                  $Tag,
+                  "--repo",
+                  $Repo,
+                  "--pattern",
+                  "manifest.json",
+                  "--dir",
+                  $dir,
+                  "--clobber"
+              ) | Out-Null
+
+              if (!(Test-Path "$dir\manifest.json")) {
+                  return $null
+              }
+
+              try {
+
+                  return (
+                      Get-Content `
+                        "$dir\manifest.json" `
+                        -Raw |
+                      ConvertFrom-Json
+                  )
+
+              }
+              catch {
+
+                  return $null
+              }
+          }
+
+
+          # ========================================================
+          # EXCLUDED FILES
+          # ========================================================
+
+          function Excluded {
+
+              param(
+                  [string]$Path
+              )
+
+              $p = $Path.Replace("/","\").ToLowerInvariant()
+
+              if ($p -match "\\appdata\\local\\temp\\") {
+                  return $true
+              }
+
+              if ($p -match "\\\.ssh\\id_[^\\]+$") {
+                  return $true
+              }
+
+              if ($p -match "\\\.aws\\credentials$") {
+                  return $true
+              }
+
+              if ($p -match "\\\.git-credentials$") {
+                  return $true
+              }
+
+              if ($p -match "\\microsoft\\credentials\\") {
+                  return $true
+              }
+
+              if ($p -match "\\login data$") {
+                  return $true
+              }
+
+              return $false
+          }
+
+
+          # ========================================================
+          # FILE MANIFEST
+          # ========================================================
+
+          function Manifest {
+
+              param(
+                  [string]$Base
+              )
+
+              $list =
+                New-Object System.Collections.Generic.List[object]
+
+              if (!(Test-Path $Base)) {
+                  return $list
+              }
+
+              Write-Host "Scanning files..."
+
+              Get-ChildItem `
+                -LiteralPath $Base `
+                -File `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue |
+
+              ForEach-Object {
+
+                  if (Excluded $_.FullName) {
+                      return
+                  }
+
+                  try {
+
+                      $relative =
+                        $_.FullName.Substring(
+                            $Base.Length
+                        ).TrimStart("\")
+
+                      $hash =
+                        (
+                            Get-FileHash `
+                              -LiteralPath $_.FullName `
+                              -Algorithm SHA256 `
+                              -ErrorAction Stop
+                        ).Hash
+
+                      $list.Add(
+                          [PSCustomObject]@{
+                              path     = $relative
+                              hash     = $hash
+                              size     = $_.Length
+                              modified =
+                                $_.LastWriteTimeUtc.ToString("o")
+                          }
+                      )
+
+                  }
+                  catch {}
+              }
+
+              Write-Host "Files scanned: $($list.Count)"
+
+              return $list
+          }
+
+
+          # ========================================================
+          # WINDOWS STATE
+          # ========================================================
+
+          function SystemState {
+
+              param(
+                  [string]$Dest
+              )
+
+              Remove-Item `
+                $Dest `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path $Dest |
                 Out-Null
 
 
-              # Installed programs
               try {
 
                   winget export `
-                    -o "$Destination\winget.json" `
+                    -o "$Dest\winget.json" `
                     --include-versions `
                     --accept-source-agreements `
                     2>$null |
@@ -652,85 +505,81 @@ jobs:
 
                   "{}" |
                     Set-Content `
-                      "$Destination\winget.json"
+                      "$Dest\winget.json"
               }
 
 
-              # Environment variables
-              @{
-                  User =
-                    [Environment]::GetEnvironmentVariables(
-                      "User"
-                    )
+              try {
 
-                  Machine =
-                    [Environment]::GetEnvironmentVariables(
-                      "Machine"
-                    )
+                  @{
+                      User =
+                        [Environment]::GetEnvironmentVariables("User")
 
-              } |
-                ConvertTo-Json -Depth 30 |
-                Set-Content `
-                  "$Destination\environment.json"
+                      Machine =
+                        [Environment]::GetEnvironmentVariables("Machine")
+
+                  } |
+                  ConvertTo-Json -Depth 30 |
+                  Set-Content `
+                    "$Dest\environment.json"
+
+              }
+              catch {}
 
 
-              # Services
               try {
 
                   Get-Service |
-                    Select-Object `
-                      Name,
-                      DisplayName,
-                      Status,
-                      StartType |
-                    ConvertTo-Json -Depth 10 |
-                    Set-Content `
-                      "$Destination\services.json"
+                  Select-Object `
+                    Name,
+                    DisplayName,
+                    Status,
+                    StartType |
+                  ConvertTo-Json -Depth 10 |
+                  Set-Content `
+                    "$Dest\services.json"
 
               }
               catch {}
 
 
-              # Scheduled tasks
               try {
 
                   Get-ScheduledTask |
-                    Select-Object `
-                      TaskName,
-                      TaskPath,
-                      State |
-                    ConvertTo-Json -Depth 10 |
-                    Set-Content `
-                      "$Destination\tasks.json"
+                  Select-Object `
+                    TaskName,
+                    TaskPath,
+                    State |
+                  ConvertTo-Json -Depth 10 |
+                  Set-Content `
+                    "$Dest\tasks.json"
 
               }
               catch {}
 
 
-              # Firewall
               try {
 
                   Get-NetFirewallRule |
-                    Select-Object `
-                      DisplayName,
-                      Enabled,
-                      Direction,
-                      Action,
-                      Profile |
-                    ConvertTo-Json -Depth 10 |
-                    Set-Content `
-                      "$Destination\firewall.json"
+                  Select-Object `
+                    DisplayName,
+                    Enabled,
+                    Direction,
+                    Action,
+                    Profile |
+                  ConvertTo-Json -Depth 10 |
+                  Set-Content `
+                    "$Dest\firewall.json"
 
               }
               catch {}
 
 
-              # HKCU
               try {
 
                   reg export `
                     HKCU `
-                    "$Destination\HKCU.reg" `
+                    "$Dest\HKCU.reg" `
                     /y |
                     Out-Null
 
@@ -740,117 +589,79 @@ jobs:
 
 
           # ========================================================
-          # Get latest manifest
+          # COPY FILES
           # ========================================================
 
-          function Get-LatestManifest {
-
-              $directory =
-                "$Work\Manifest"
-
-              Remove-Item `
-                $directory `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
-
-              New-Item `
-                -ItemType Directory `
-                -Force `
-                -Path $directory |
-                Out-Null
-
-
-              gh release download `
-                $Tag `
-                --repo $Repo `
-                --pattern "manifest.json" `
-                --dir $directory `
-                --clobber `
-                2>$null
-
-
-              if (
-                $LASTEXITCODE -ne 0 -or
-                !(Test-Path "$directory\manifest.json")
-              ) {
-                  return $null
-              }
-
-
-              try {
-
-                  return (
-                    Get-Content `
-                      "$directory\manifest.json" `
-                      -Raw |
-                    ConvertFrom-Json
-                  )
-              }
-              catch {
-
-                  return $null
-              }
-          }
-
-
-          # ========================================================
-          # Copy changed files
-          # ========================================================
-
-          function Copy-ManifestFiles {
+          function Copy-Files {
 
               param(
                   $Files,
-                  [string]$SourceRoot,
-                  [string]$DestinationRoot
+                  [string]$Source,
+                  [string]$Dest
               )
 
-              foreach($file in @($Files)) {
+              foreach ($f in @($Files)) {
 
-                  $source =
+                  $src =
                     Join-Path `
-                      $SourceRoot `
-                      $file.path
+                      $Source `
+                      $f.path
 
-
-                  if (!(Test-Path $source)) {
+                  if (!(Test-Path $src)) {
                       continue
                   }
 
-
-                  if (Test-Excluded $source) {
+                  if (Excluded $src) {
                       continue
                   }
 
-
-                  $destination =
+                  $dst =
                     Join-Path `
-                      $DestinationRoot `
-                      $file.path
-
+                      $Dest `
+                      $f.path
 
                   New-Item `
                     -ItemType Directory `
                     -Force `
                     -Path (
                       Split-Path `
-                        $destination `
+                        $dst `
                         -Parent
                     ) |
                     Out-Null
 
-
                   Copy-Item `
-                    $source `
-                    $destination `
+                    $src `
+                    $dst `
                     -Force
               }
           }
 
 
           # ========================================================
-          # Save Snapshot
+          # UPLOAD
+          # ========================================================
+
+          function Upload {
+
+              param(
+                  [string]$Path
+              )
+
+              GH @(
+                  "release",
+                  "upload",
+                  $Tag,
+                  $Path,
+                  "--repo",
+                  $Repo,
+                  "--clobber"
+              ) | Out-Null
+          }
+
+
+          # ========================================================
+          # SAVE SNAPSHOT
           # ========================================================
 
           function Save-Snapshot {
@@ -859,55 +670,45 @@ jobs:
                   [string]$Reason
               )
 
-
               Write-Host ""
               Write-Host "=============================================="
-              Write-Host " SNAPSHOT START"
-              Write-Host " Reason: $Reason"
+              Write-Host "SNAPSHOT"
+              Write-Host "Reason: $Reason"
               Write-Host "=============================================="
 
 
               Ensure-Release
 
 
-              # Full scan
               $current =
-                @(Get-FileManifest $UserRoot)
+                @(Manifest $UserRoot)
 
 
-              # Windows state
-              $systemState =
+              $state =
                 "$Work\SystemState"
 
-              Save-SystemState `
-                $systemState
+              SystemState $state
 
 
-              # Existing snapshot
               $old =
-                Get-LatestManifest
+                Download-Manifest
 
 
               # ====================================================
-              # First snapshot
+              # BASE SNAPSHOT
               # ====================================================
 
               if ($null -eq $old) {
 
-                  Write-Host "No previous snapshot."
-                  Write-Host "Creating BASE snapshot."
+                  Write-Host "Creating BASE snapshot..."
 
-
-                  $sequence =
-                    1
+                  $seq = 1
 
                   $base =
-                    "base-{0:D4}.zip" -f $sequence
-
+                    "base-{0:D4}.zip" -f $seq
 
                   $build =
                     "$Work\Base"
-
 
                   Remove-Item `
                     $build `
@@ -915,98 +716,88 @@ jobs:
                     -Force `
                     -ErrorAction SilentlyContinue
 
-
                   New-Item `
                     -ItemType Directory `
                     -Force `
                     -Path "$build\Files" |
                     Out-Null
 
-
-                  Copy-ManifestFiles `
+                  Copy-Files `
                     $current `
                     $UserRoot `
                     "$build\Files"
 
-
                   Copy-Item `
-                    $systemState `
+                    $state `
                     "$build\SystemState" `
                     -Recurse `
                     -Force
 
-
                   $zip =
                     "$Work\$base"
 
-
-                  Remove-Item `
-                    $zip `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-
-
                   Compress-Archive `
-                    -Path "$build\*" `
-                    -DestinationPath $zip `
+                    "$build\*" `
+                    $zip `
                     -CompressionLevel Optimal `
                     -Force
 
-
-                  Invoke-GH @(
-                    "release",
-                    "upload",
-                    $Tag,
-                    $zip,
-                    "--repo",
-                    $Repo,
-                    "--clobber"
-                  )
+                  Upload $zip
 
 
-                  $manifest = @{
+                  $manifest =
+                    [ordered]@{
+
                       schema = 1
-                      sequence = 1
+
+                      sequence = $seq
+
                       baseAsset = $base
+
                       deltaAssets = @()
+
                       files = $current
+
                       createdUtc =
                         [DateTime]::UtcNow.ToString("o")
+
                       changedFiles =
                         $current.Count
+
                       deletedFiles = 0
+
                       reason = $Reason
-                  }
+                    }
               }
 
 
               # ====================================================
-              # Delta snapshot
+              # DELTA SNAPSHOT
               # ====================================================
 
               else {
 
                   $oldMap = @{}
 
-                  foreach($f in @($old.files)) {
+                  foreach ($f in @($old.files)) {
                       $oldMap[$f.path] = $f
                   }
 
 
                   $newMap = @{}
 
-                  foreach($f in $current) {
+                  foreach ($f in $current) {
                       $newMap[$f.path] = $f
                   }
 
 
                   $changed = @()
 
-                  foreach($f in $current) {
+                  foreach ($f in $current) {
 
                       if (
-                        !$oldMap.ContainsKey($f.path) -or
-                        $oldMap[$f.path].hash -ne $f.hash
+                          !$oldMap.ContainsKey($f.path) -or
+                          $oldMap[$f.path].hash -ne $f.hash
                       ) {
 
                           $changed += $f
@@ -1016,48 +807,37 @@ jobs:
 
                   $deleted = @()
 
-                  foreach($f in @($old.files)) {
+                  foreach ($f in @($old.files)) {
 
-                      if (
-                        !$newMap.ContainsKey($f.path)
-                      ) {
+                      if (!$newMap.ContainsKey($f.path)) {
 
                           $deleted += $f.path
                       }
                   }
 
 
-                  $sequence =
+                  $seq =
                     [int]$old.sequence + 1
-
-
-                  $base =
-                    [string]$old.baseAsset
-
 
                   $deltas =
                     @($old.deltaAssets)
 
-
                   $delta =
-                    "delta-{0:D4}.zip" -f $sequence
+                    "delta-{0:D4}.zip" -f $seq
 
 
-                  Write-Host ""
-                  Write-Host "Changed files: $($changed.Count)"
-                  Write-Host "Deleted files: $($deleted.Count)"
+                  Write-Host "Changed: $($changed.Count)"
+                  Write-Host "Deleted: $($deleted.Count)"
 
 
                   $build =
                     "$Work\Delta"
-
 
                   Remove-Item `
                     $build `
                     -Recurse `
                     -Force `
                     -ErrorAction SilentlyContinue
-
 
                   New-Item `
                     -ItemType Directory `
@@ -1066,7 +846,7 @@ jobs:
                     Out-Null
 
 
-                  Copy-ManifestFiles `
+                  Copy-Files `
                     $changed `
                     $UserRoot `
                     "$build\Files"
@@ -1079,7 +859,7 @@ jobs:
 
 
                   Copy-Item `
-                    $systemState `
+                    $state `
                     "$build\SystemState" `
                     -Recurse `
                     -Force
@@ -1088,48 +868,28 @@ jobs:
                   $zip =
                     "$Work\$delta"
 
-
-                  Remove-Item `
-                    $zip `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-
-
                   Compress-Archive `
-                    -Path "$build\*" `
-                    -DestinationPath $zip `
+                    "$build\*" `
+                    $zip `
                     -CompressionLevel Optimal `
                     -Force
 
-
-                  Invoke-GH @(
-                    "release",
-                    "upload",
-                    $Tag,
-                    $zip,
-                    "--repo",
-                    $Repo,
-                    "--clobber"
-                  )
-
+                  Upload $zip
 
                   $deltas += $delta
 
 
-                  # =================================================
-                  # Compact after 10 deltas
-                  # =================================================
+                  # ==================================================
+                  # COMPACT AFTER 10 DELTAS
+                  # ==================================================
 
                   if ($deltas.Count -ge 10) {
 
-                      Write-Host ""
-                      Write-Host "10 deltas reached."
-                      Write-Host "Creating new BASE."
+                      Write-Host "Compacting snapshots..."
 
 
                       $newBase =
-                        "base-{0:D4}.zip" -f $sequence
-
+                        "base-{0:D4}.zip" -f $seq
 
                       $newBuild =
                         "$Work\NewBase"
@@ -1149,14 +909,14 @@ jobs:
                         Out-Null
 
 
-                      Copy-ManifestFiles `
+                      Copy-Files `
                         $current `
                         $UserRoot `
                         "$newBuild\Files"
 
 
                       Copy-Item `
-                        $systemState `
+                        $state `
                         "$newBuild\SystemState" `
                         -Recurse `
                         -Force
@@ -1167,78 +927,87 @@ jobs:
 
 
                       Compress-Archive `
-                        -Path "$newBuild\*" `
-                        -DestinationPath $newZip `
+                        "$newBuild\*" `
+                        $newZip `
                         -CompressionLevel Optimal `
                         -Force
 
 
-                      Invoke-GH @(
-                        "release",
-                        "upload",
-                        $Tag,
-                        $newZip,
-                        "--repo",
-                        $Repo,
-                        "--clobber"
-                      )
+                      Upload $newZip
 
 
-                      # Delete old assets
-                      foreach($asset in $deltas) {
+                      foreach ($a in $deltas) {
 
-                          gh release delete-asset `
-                            $Tag `
-                            $asset `
-                            --repo $Repo `
-                            --yes `
-                            2>$null |
-                            Out-Null
+                          GH-Safe @(
+                              "release",
+                              "delete-asset",
+                              $Tag,
+                              $a,
+                              "--repo",
+                              $Repo,
+                              "--yes"
+                          ) | Out-Null
                       }
 
 
                       if (
-                        $base -and
-                        $base -ne $newBase
+                          $old.baseAsset -and
+                          $old.baseAsset -ne $newBase
                       ) {
 
-                          gh release delete-asset `
-                            $Tag `
-                            $base `
-                            --repo $Repo `
-                            --yes `
-                            2>$null |
-                            Out-Null
+                          GH-Safe @(
+                              "release",
+                              "delete-asset",
+                              $Tag,
+                              $old.baseAsset,
+                              "--repo",
+                              $Repo,
+                              "--yes"
+                          ) | Out-Null
                       }
 
 
-                      $base =
-                        $newBase
+                      $base = $newBase
 
-                      $deltas =
-                        @()
+                      $deltas = @()
+                  }
+
+                  else {
+
+                      $base =
+                        [string]$old.baseAsset
                   }
 
 
-                  $manifest = @{
+                  $manifest =
+                    [ordered]@{
+
                       schema = 1
-                      sequence = $sequence
+
+                      sequence = $seq
+
                       baseAsset = $base
+
                       deltaAssets = $deltas
+
                       files = $current
+
                       createdUtc =
                         [DateTime]::UtcNow.ToString("o")
+
                       changedFiles =
                         $changed.Count
+
                       deletedFiles =
                         $deleted.Count
+
                       reason = $Reason
-                  }
+                    }
               }
 
 
               # ====================================================
-              # Upload manifest
+              # SAVE MANIFEST
               # ====================================================
 
               $manifestPath =
@@ -1252,98 +1021,35 @@ jobs:
                   -Encoding utf8
 
 
-              Invoke-GH @(
-                "release",
-                "upload",
-                $Tag,
-                $manifestPath,
-                "--repo",
-                $Repo,
-                "--clobber"
-              )
-
-
-              # ====================================================
-              # Change report
-              # ====================================================
-
-              $reportPath =
-                "$Work\CHANGE-REPORT.txt"
-
-
-              @"
-RDP AUTOMATIC SNAPSHOT
-
-UTC:
-$([DateTime]::UtcNow.ToString("o"))
-
-Sequence:
-$($manifest.sequence)
-
-Base:
-$($manifest.baseAsset)
-
-Delta count:
-$(@($manifest.deltaAssets).Count)
-
-Changed files:
-$($manifest.changedFiles)
-
-Deleted files:
-$($manifest.deletedFiles)
-
-Reason:
-$Reason
-
-Credential stores and private keys are excluded.
-"@ |
-                Set-Content `
-                  $reportPath `
-                  -Encoding utf8
-
-
-              Invoke-GH @(
-                "release",
-                "upload",
-                $Tag,
-                $reportPath,
-                "--repo",
-                $Repo,
-                "--clobber"
-              )
+              Upload $manifestPath
 
 
               Write-Host ""
-              Write-Host "=============================================="
-              Write-Host " SNAPSHOT COMPLETE"
-              Write-Host " Sequence: $($manifest.sequence)"
-              Write-Host " Changed : $($manifest.changedFiles)"
-              Write-Host " Deleted : $($manifest.deletedFiles)"
-              Write-Host "=============================================="
-
-              return $manifest
+              Write-Host "SNAPSHOT COMPLETE"
+              Write-Host "Sequence: $($manifest.sequence)"
+              Write-Host "Changed : $($manifest.changedFiles)"
+              Write-Host "Deleted : $($manifest.deletedFiles)"
           }
 
 
           # ========================================================
-          # Restore latest snapshot
+          # RESTORE
           # ========================================================
 
           function Restore-Latest {
 
               Write-Host ""
-              Write-Host "=============================================="
-              Write-Host " RESTORE LATEST SNAPSHOT"
-              Write-Host "=============================================="
+              Write-Host "RESTORING LATEST SNAPSHOT"
 
 
-              $manifest =
-                Get-LatestManifest
+              $m =
+                Download-Manifest
 
 
-              if ($null -eq $manifest) {
+              if ($null -eq $m) {
 
                   Write-Host "No snapshot exists."
+
                   return
               }
 
@@ -1366,44 +1072,38 @@ Credential stores and private keys are excluded.
                 Out-Null
 
 
-              # ----------------------------------------------------
-              # Download BASE
-              # ----------------------------------------------------
+              # ====================================================
+              # BASE
+              # ====================================================
 
-              Write-Host `
-                "Downloading $($manifest.baseAsset)"
-
-
-              gh release download `
-                $Tag `
-                --repo $Repo `
-                --pattern $manifest.baseAsset `
-                --dir $restore `
-                --clobber
-
-
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Could not download base snapshot."
-              }
+              GH @(
+                  "release",
+                  "download",
+                  $Tag,
+                  "--repo",
+                  $Repo,
+                  "--pattern",
+                  $m.baseAsset,
+                  "--dir",
+                  $restore,
+                  "--clobber"
+              ) | Out-Null
 
 
               Expand-Archive `
-                "$restore\$($manifest.baseAsset)" `
+                "$restore\$($m.baseAsset)" `
                 "$restore\Base" `
                 -Force
 
 
-              # ----------------------------------------------------
-              # Restore BASE files
-              # ----------------------------------------------------
-
-              if(Test-Path "$restore\Base\Files") {
+              if (Test-Path "$restore\Base\Files") {
 
                   Get-ChildItem `
                     "$restore\Base\Files" `
                     -File `
                     -Recurse `
                     -Force |
+
                   ForEach-Object {
 
                       $relative =
@@ -1437,27 +1137,27 @@ Credential stores and private keys are excluded.
               }
 
 
-              # ----------------------------------------------------
-              # Apply DELTAS
-              # ----------------------------------------------------
+              # ====================================================
+              # DELTAS
+              # ====================================================
 
-              foreach($delta in @($manifest.deltaAssets)) {
+              foreach ($delta in @($m.deltaAssets)) {
 
-                  Write-Host `
-                    "Applying $delta"
-
-
-                  gh release download `
-                    $Tag `
-                    --repo $Repo `
-                    --pattern $delta `
-                    --dir $restore `
-                    --clobber
+                  Write-Host "Applying $delta"
 
 
-                  if ($LASTEXITCODE -ne 0) {
-                      throw "Could not download $delta"
-                  }
+                  GH @(
+                      "release",
+                      "download",
+                      $Tag,
+                      "--repo",
+                      $Repo,
+                      "--pattern",
+                      $delta,
+                      "--dir",
+                      $restore,
+                      "--clobber"
+                  ) | Out-Null
 
 
                   $deltaDir =
@@ -1477,13 +1177,14 @@ Credential stores and private keys are excluded.
                     -Force
 
 
-                  if(Test-Path "$deltaDir\Files") {
+                  if (Test-Path "$deltaDir\Files") {
 
                       Get-ChildItem `
                         "$deltaDir\Files" `
                         -File `
                         -Recurse `
                         -Force |
+
                       ForEach-Object {
 
                           $relative =
@@ -1517,8 +1218,7 @@ Credential stores and private keys are excluded.
                   }
 
 
-                  # Deleted files
-                  if(Test-Path "$deltaDir\deleted.json") {
+                  if (Test-Path "$deltaDir\deleted.json") {
 
                       try {
 
@@ -1531,7 +1231,7 @@ Credential stores and private keys are excluded.
                             )
 
 
-                          foreach($relative in $deleted) {
+                          foreach ($relative in $deleted) {
 
                               $target =
                                 Join-Path `
@@ -1539,7 +1239,7 @@ Credential stores and private keys are excluded.
                                   $relative
 
 
-                              if(
+                              if (
                                 Test-Path `
                                   $target `
                                   -PathType Leaf
@@ -1558,61 +1258,55 @@ Credential stores and private keys are excluded.
               }
 
 
-              Write-Host ""
-              Write-Host "=============================================="
-              Write-Host " RESTORE COMPLETE"
-              Write-Host " Snapshot sequence: $($manifest.sequence)"
-              Write-Host "=============================================="
+              Write-Host "RESTORE COMPLETE."
           }
 
 
           # ========================================================
-          # Restore
+          # RESTORE IF REQUESTED
           # ========================================================
 
-          if (
-            "$env:RESTORE_LATEST" -eq "true"
-          ) {
+          if ("$env:RESTORE_LATEST" -eq "true") {
 
               Restore-Latest
           }
 
 
           # ========================================================
-          # Initial snapshot
+          # INITIAL SNAPSHOT
           # ========================================================
 
-          if ($null -eq (Get-LatestManifest)) {
+          if ($null -eq (Download-Manifest)) {
 
-              Save-Snapshot `
-                "initial"
+              Save-Snapshot "initial"
           }
 
 
           # ========================================================
-          # LIVE FILE WATCHER
+          # LIVE WATCHER
           # ========================================================
 
-          Write-Host ""
-          Write-Host "Starting Live FileSystemWatcher..."
+          $journal =
+            "$Root\live-journal.jsonl"
 
 
           Remove-Item `
-            $LiveJournal `
+            $journal `
             -Force `
             -ErrorAction SilentlyContinue
 
 
           $watcher =
-            New-Object `
-              System.IO.FileSystemWatcher
+            New-Object IO.FileSystemWatcher
 
 
           $watcher.Path =
             $UserRoot
 
+
           $watcher.IncludeSubdirectories =
             $true
+
 
           $watcher.NotifyFilter =
             [IO.NotifyFilters]::FileName `
@@ -1623,17 +1317,17 @@ Credential stores and private keys are excluded.
             -bor `
             [IO.NotifyFilters]::Size
 
+
           $watcher.EnableRaisingEvents =
             $true
 
 
-          $eventAction = {
+          $action = {
 
               $path =
                 $Event.SourceEventArgs.FullPath
 
-
-              if (!(Test-Excluded $path)) {
+              if (!(Excluded $path)) {
 
                   [PSCustomObject]@{
 
@@ -1647,9 +1341,9 @@ Credential stores and private keys are excluded.
                         $path
 
                   } |
-                    ConvertTo-Json -Compress |
-                    Add-Content `
-                      $using:LiveJournal
+                  ConvertTo-Json -Compress |
+                  Add-Content `
+                    $using:journal
               }
           }
 
@@ -1657,9 +1351,8 @@ Credential stores and private keys are excluded.
           $subscriptions = @()
 
 
-          foreach(
-            $eventName in
-            @(
+          foreach (
+            $eventName in @(
               "Created",
               "Changed",
               "Deleted",
@@ -1671,34 +1364,12 @@ Credential stores and private keys are excluded.
                 Register-ObjectEvent `
                   -InputObject $watcher `
                   -EventName $eventName `
-                  -Action $eventAction
+                  -Action $action
           }
 
 
-          Write-Host "Live FileSystemWatcher: ACTIVE"
-
-
           # ========================================================
-          # Register active RDP session
-          # ========================================================
-
-          Set-RepoVariable `
-            "RDP_SESSION_ID" `
-            $env:SESSION_ID
-
-
-          Set-RepoVariable `
-            "RDP_SAVE_REQUEST" `
-            "0"
-
-
-          Set-RepoVariable `
-            "RDP_SAVE_ACK" `
-            "0"
-
-
-          # ========================================================
-          # RDP information
+          # RDP INFORMATION
           # ========================================================
 
           Write-Host ""
@@ -1711,11 +1382,11 @@ Credential stores and private keys are excluded.
           Write-Host "Password     : $env:RDP_PASSWORD"
           Write-Host ""
           Write-Host "Live Watcher : ACTIVE"
-          Write-Host "Auto Snapshot: EVERY 5 MINUTES"
+          Write-Host "Snapshot     : EVERY 5 MINUTES"
+          Write-Host ""
           Write-Host "=================================================="
 
 
-          # GitHub Step Summary
           @"
           # Windows RDP
 
@@ -1725,29 +1396,25 @@ Credential stores and private keys are excluded.
 
           **Password:** `$env:RDP_PASSWORD`
 
-          ## Snapshot
+          ## Snapshot Engine
 
           - Live FileSystemWatcher: ACTIVE
-          - Automatic SHA-256 scan: EVERY 5 MINUTES
+          - SHA-256 snapshot: every 5 minutes
           - Base + Delta snapshots: ENABLED
           - Restore latest: $env:RESTORE_LATEST
+          - Final snapshot: $env:FINAL_SNAPSHOT
           "@ |
-            Out-File `
-              -FilePath $env:GITHUB_STEP_SUMMARY `
-              -Encoding utf8
+          Out-File `
+            $env:GITHUB_STEP_SUMMARY `
+            -Encoding utf8
 
 
           # ========================================================
-          # Main loop
+          # KEEP RDP ALIVE
           # ========================================================
 
           $started =
             Get-Date
-
-
-          $lastRequest =
-            Get-RepoVariable `
-              "RDP_SAVE_REQUEST"
 
 
           $lastSnapshot =
@@ -1756,61 +1423,14 @@ Credential stores and private keys are excluded.
 
           try {
 
-              while(
+              while (
                 ((Get-Date) - $started).TotalMinutes -lt 345
               ) {
 
-
-                  # =================================================
-                  # Force Snapshot request
-                  # =================================================
-
-                  $request =
-                    Get-RepoVariable `
-                      "RDP_SAVE_REQUEST"
+                  Start-Sleep -Seconds 10
 
 
-                  if(
-                    $request -and
-                    $request -ne "0" -and
-                    $request -ne $lastRequest -and
-                    $request.StartsWith(
-                      "$env:SESSION_ID`:"
-                    )
-                  ) {
-
-                      Write-Host ""
-                      Write-Host "FORCE SNAPSHOT REQUEST RECEIVED"
-
-
-                      $lastRequest =
-                        $request
-
-
-                      try {
-
-                          Save-Snapshot `
-                            "force-request"
-
-
-                          Set-RepoVariable `
-                            "RDP_SAVE_ACK" `
-                            $request
-
-                      }
-                      catch {
-
-                          Write-Host `
-                            "Force snapshot failed: $($_.Exception.Message)"
-                      }
-                  }
-
-
-                  # =================================================
-                  # Automatic snapshot every 5 minutes
-                  # =================================================
-
-                  if(
+                  if (
                     ((Get-Date) - $lastSnapshot).TotalMinutes -ge 5
                   ) {
 
@@ -1822,7 +1442,7 @@ Credential stores and private keys are excluded.
                       }
                       catch {
 
-                          Write-Host `
+                          Write-Warning `
                             "Automatic snapshot failed: $($_.Exception.Message)"
                       }
 
@@ -1830,22 +1450,20 @@ Credential stores and private keys are excluded.
                       $lastSnapshot =
                         Get-Date
                   }
-
-
-                  Start-Sleep `
-                    -Seconds 10
               }
           }
+
+
           finally {
 
-              Write-Host ""
-              Write-Host "Stopping Live Watcher..."
+              Write-Host "Stopping live watcher..."
 
 
-              foreach($subscription in $subscriptions) {
+              foreach ($subscription in $subscriptions) {
 
                   Unregister-Event `
-                    -SubscriptionId $subscription.Id `
+                    -SubscriptionId `
+                    $subscription.Id `
                     -ErrorAction SilentlyContinue
               }
 
@@ -1853,14 +1471,15 @@ Credential stores and private keys are excluded.
               $watcher.EnableRaisingEvents =
                 $false
 
+
               $watcher.Dispose()
 
 
-              # =====================================================
-              # Final snapshot
-              # =====================================================
+              # ====================================================
+              # FINAL SNAPSHOT
+              # ====================================================
 
-              if(
+              if (
                 "$env:FINAL_SNAPSHOT" -eq "true"
               ) {
 
@@ -1872,29 +1491,9 @@ Credential stores and private keys are excluded.
                   }
                   catch {
 
-                      Write-Host `
+                      Write-Warning `
                         "Final snapshot failed: $($_.Exception.Message)"
                   }
-              }
-
-
-              # =====================================================
-              # Clear active session
-              # =====================================================
-
-              $currentSession =
-                Get-RepoVariable `
-                  "RDP_SESSION_ID"
-
-
-              if(
-                $currentSession `
-                -eq $env:SESSION_ID
-              ) {
-
-                  Set-RepoVariable `
-                    "RDP_SESSION_ID" `
-                    ""
               }
 
 
