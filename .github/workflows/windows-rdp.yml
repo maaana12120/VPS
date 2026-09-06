@@ -17,21 +17,14 @@ jobs:
       - name: Enable Remote Desktop
         shell: powershell
         run: |
-          Set-ItemProperty 
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' 
-            -Name 'fDenyTSConnections' 
-            -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
 
-          # Keep Network Level Authentication enabled
-          Set-ItemProperty 
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
-            -Name 'UserAuthentication' 
-            -Value 1
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
 
-          Enable-NetFirewallRule 
-            -DisplayGroup 'Remote Desktop'
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-          Restart-Service TermService -Force
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
 
       # 2. Create RDP account with random password
       - name: Create RDP Account
@@ -60,34 +53,28 @@ jobs:
           # Shuffle
           $password = -join ($chars | Sort-Object { Get-Random })
 
-          $securePassword = ConvertTo-SecureString 
-            $password 
-            -AsPlainText 
-            -Force
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser 
-            -Name $env:RDP_USERNAME 
-            -Password $securePassword 
-            -AccountNeverExpires 
-            -PasswordNeverExpires 
-            -UserMayNotChangePassword 
-            -ErrorAction SilentlyContinue
+          # Remove existing account if present
+          $existingUser = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
 
-          Add-LocalGroupMember 
-            -Group "Administrators" 
-            -Member $env:RDP_USERNAME 
-            -ErrorAction SilentlyContinue
+          if ($existingUser) {
+            Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          }
 
-          Add-LocalGroupMember 
-            -Group "Remote Desktop Users" 
-            -Member $env:RDP_USERNAME 
-            -ErrorAction SilentlyContinue
+          New-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -UserMayNotChangePassword
 
-          # Save for the next step
-          "RDP_PASSWORD=$password" | Out-File 
-            -FilePath $env:GITHUB_ENV 
-            -Encoding utf8 
-            -Append
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          # Save password for next step
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # 3. Install and connect Tailscale
       - name: Connect Tailscale
@@ -102,20 +89,16 @@ jobs:
           $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
           $installer = "$env:TEMP\tailscale.msi"
 
-          Invoke-WebRequest 
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" 
-            -OutFile $installer
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installer
 
-          Start-Process 
-            -FilePath "msiexec.exe" 
-            -ArgumentList "/i "$installer" /quiet /norestart" 
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
             -Wait
 
           Start-Sleep -Seconds 5
 
-          & $tailscale up 
-            --authkey="$env:TAILSCALE_AUTHKEY" 
-            --hostname="github-rdp-server"
+          & $tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
 
           Start-Sleep -Seconds 8
 
@@ -125,10 +108,7 @@ jobs:
             throw "Could not get Tailscale IP."
           }
 
-          "TAILSCALE_IP=$ip" | Out-File 
-            -FilePath $env:GITHUB_ENV 
-            -Encoding utf8 `
-            -Append
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # 4. Show RDP connection information
       - name: RDP Ready
@@ -148,7 +128,7 @@ jobs:
           Write-Host ""
           Write-Host "=================================================="
 
-      # 5. Keep the RDP alive for approximately 6 hours
+      # 5. Keep the runner alive
       - name: Keep Server Alive
         shell: powershell
         run: |
